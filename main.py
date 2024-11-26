@@ -1,726 +1,892 @@
-# -*- coding: utf-8 -*-
-
-# Importing Libraries and Arranging Console Display.
 import pandas as pd
 import numpy as np
+import xarray as xr
+import pickle
+import requests
 import os
-from datetime import datetime
-from scipy.spatial import distance
-from statsmodels.tsa.statespace.sarimax import SARIMAX
+import re
 import warnings
-warnings.filterwarnings("ignore")
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+import sys
+import shap
+import plotly.express as px
+import plotly.graph_objs as go
+from scipy.spatial.distance import cdist
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
 pd.set_option('display.float_format', lambda x: '%.3f' % x)
 pd.set_option('display.max_colwidth', None)
 pd.set_option('display.width', 500)
 
-# FUNCTIONS
-def station_coordinates(input):
-    """
-    Creates a dataset consisting of measurement station IDs and their corresponding X and Y coordinates.
+warnings.filterwarnings("ignore")
 
-    Args:
-        input: Directory of the measurement station CSV file.
+########################################################################################################################
+# GRACE
+########################################################################################################################
+# Opening .nc data files and converting the variables from these files into dataframes
+df_land = xr.open_dataset('supplemental_material_for_task_2/datasets/CSR_GRACE_GRACE-FO_RL06_Mascons_v02_LandMask.nc')
+df_land = df_land['LO_val'].to_dataframe().reset_index()
 
-    Returns:
-        df: A DataFrame containing columns "x", "y", and "hzbnr01".
-    """
-    df = pd.read_csv(f"Ehyd/datasets_ehyd/{input}/messstellen_alle.csv", sep=";")
-    output_df = df[["x", "y", "hzbnr01"]].copy()
-    output_df['x'] = output_df['x'].astype(str).str.replace(',', '.').astype("float32")
-    output_df['y'] = output_df['y'].astype(str).str.replace(',', '.').astype("float32")
-    return output_df
+df_lwe = xr.open_dataset('supplemental_material_for_task_2/datasets/CSR_GRACE_GRACE-FO_RL0602_Mascons_all-corrections.nc')
+df_lwe = df_lwe["lwe_thickness"].to_dataframe().reset_index()
 
-def to_dataframe(folder_path, tip_coordinates):
-    """
-    Processes CSV files in the specified folder, skipping header information and creating DataFrames
-    from the section marked by "Werte". Converts "LÃ¼cke" (Gap) values to NaN and skips rows with
-    invalid data or specific keywords.
+# Reducing the df_lwe dataframe based on the land mask
+df_land_expanded = pd.concat([df_land['LO_val']] * 232, ignore_index=True)
 
-    For each CSV file, it extracts data starting after the "Werte:" line, processes date and value
-    columns, and stores each DataFrame in a dictionary where the key is derived from the filename.
-    Additionally, it matches IDs with tip coordinates and returns a DataFrame containing matched coordinates.
+df = pd.concat([df_lwe, df_land_expanded], axis=1)
+df = df[df['LO_val'] == 1]
+df.drop("LO_val", axis=1, inplace=True)
+df.reset_index(drop=True, inplace=True)
 
-    Args:
-        folder_path (str): The directory path where the CSV files are located.
-        tip_coordinates (pd.DataFrame): A DataFrame containing coordinates to be matched with the IDs.
+# Transforming "time" column to date format
+missing_months = ('2002-06;2002-07;2003-06;2011-01;2011-06;2012-05;2012-10;2013-03;2013-08;2013-09;2014-02;2014-07;'
+                  '2014-12;2015-06;2015-10;2015-11;2016-04;2016-09;2016-10;2017-02;2017-02;2017-07;2017-08;2017-09;'
+                  '2017-10;2017-11;2017-12;2018-01;2018-02;2018-03;2018-04;2018-05;2018-08;2018-09')
+missing_months_list = missing_months.split(';')
 
-    Returns:
-        dict: A dictionary where keys are IDs (extracted from filenames) and values are DataFrames.
-        pd.DataFrame: A DataFrame with matched coordinates based on IDs.
-    """
-    dataframes_dict = {}
-    coordinates = pd.DataFrame()
+start_date = pd.Period('2002-04', freq='M')
+all_months = pd.period_range(start=start_date, end='2024-04', freq='M')
 
-    for filename in os.listdir(folder_path):
+filtered_months = [str(month) for month in all_months if str(month) not in missing_months_list]
+
+df['time'] = pd.Series(filtered_months).repeat(df.shape[0] // len(filtered_months)).reset_index(drop=True)[:df.shape[0]]
+
+# GRACE after 2010.01 in time column
+df = df[df['time'] >= '2010-01']
+df['lon'] = df['lon'].apply(lambda x: x - 360 if x > 180 else x)
+df.reset_index(drop=True, inplace=True)
+
+# Checking whether coordinates are same for each month
+reference_month_grace = df[df['time'] == '2010-01'][['lat', 'lon']].reset_index(drop=True)
+
+comparison = {}
+for month in df['time'].unique():
+    if month != '2010-01':
+        comparison[month] = df[df['time'] == month][['lat', 'lon']].reset_index(drop=True)
+
+results = {month: (reference_month_grace.equals(data) for month, data in comparison.items())}
+
+for month, is_equal in results.items():
+    print(f"Comparison result for {month}: {'Same' if is_equal else 'Different'}")
+
+########################################################################################################################
+# GLDAS
+########################################################################################################################
+# Please see GLDAS website for how to authenticate your device for data fetching.
+# This function will not work unless the authentication steps are complete.
+
+def load_gldas_dict_2004_2009():
+    # 1. Fetch data between 2004-2009 to match GRACE's averaged format
+    file_path = "supplemental_material_for_task_2/datasets/2004_2009_avg_gldas_noah_2209.txt"
+    ds_dict = {}
+    with open(file_path, "r") as f:
+        # Skip the first line
+        next(f)
+
+        for line in f:
+            url = line.strip()
+            match = re.search(r'(\d{6})\.\d+\.nc4', url)
+            if match:
+                date = match.group(1)
+            else:
+                print(f'No date found in URL: {url}')
+                continue
+
+            print(f'Downloading {url}...')
+            try:
+                response = requests.get(url)
+                response.raise_for_status()  # Check for request errors
+
+                temp_file_name = f"temp_{date}.nc4"
+                with open(temp_file_name, 'wb') as temp_file:
+                    temp_file.write(response.content)
+
+                ds_dict[date] = xr.open_dataset(temp_file_name)
+                os.remove(temp_file_name)
+                print(f'Dataset for {date} added to dictionary.')
+
+            except requests.exceptions.RequestException as e:
+                print(f'Error downloading {url}: {e}')
+            except Exception as e:
+                print(f'Error processing file {temp_file_name}: {e}')
+
+    print('All files processed!')
+
+    for key, value in ds_dict.items():
+        ds_dict[key] = value.load()
+
+    ds = ds_dict["200401"]
+    variables = list(ds.data_vars)[1:]
+    monthly_gldas_2004_2009 = {}
+
+    for key, value in ds_dict.items():
+        df = pd.DataFrame()
+
+        for feature in variables:
+            data_array = value[feature]
+            feature_df = data_array.to_dataframe().reset_index().drop("time", axis=1)
+            feature_df = feature_df.dropna(subset=[f"{feature}"])
+
+            if df.empty:
+                df = feature_df
+            else:
+                df = df.merge(feature_df, on=["lat", "lon"])
+
+        monthly_gldas_2004_2009[key] = df.reset_index(drop=True)
+    return monthly_gldas_2004_2009
+
+
+def load_gldas_dict_2010_2024():
+    # 2. Fetch data between 2010-2024 for data analysis
+    file_path = "supplemental_material_for_task_2/datasets/subset_GLDAS_NOAH025_M_2.1_20240918_193208_.txt"
+    ds_dict = {}
+    with open(file_path, "r") as f:
+        # Skip the first line
+        next(f)
+
+        for line in f:
+            url = line.strip()
+            match = re.search(r'(\d{6})\.\d+\.nc4', url)
+            if match:
+                date = match.group(1)
+            else:
+                print(f'No date found in URL: {url}')
+                continue
+
+            print(f'Downloading {url}...')
+            try:
+                response = requests.get(url)
+                response.raise_for_status()  # Check for request errors
+
+                temp_file_name = f"temp_{date}.nc4"
+                with open(temp_file_name, 'wb') as temp_file:
+                    temp_file.write(response.content)
+
+                ds_dict[date] = xr.open_dataset(temp_file_name)
+                os.remove(temp_file_name)
+                print(f'Dataset for {date} added to dictionary.')
+
+            except requests.exceptions.RequestException as e:
+                print(f'Error downloading {url}: {e}')
+            except Exception as e:
+                print(f'Error processing file {temp_file_name}: {e}')
+
+    print('All files processed!')
+
+    for key, value in ds_dict.items():
+        ds_dict[key] = value.load()
+
+    ds = ds_dict["201210"]
+    variables = list(ds.data_vars)[1:]
+    gldas_dict_2010_2024 = {}
+
+    for key, value in ds_dict.items():
+        df = pd.DataFrame()
+
+        for feature in variables:
+            data_array = value[feature]
+            feature_df = data_array.to_dataframe().reset_index().drop("time", axis=1)
+            feature_df = feature_df.dropna(subset=[f"{feature}"])
+
+            if df.empty:
+                df = feature_df
+            else:
+                df = df.merge(feature_df, on=["lat", "lon"])
+
+        gldas_dict_2010_2024[key] = df.reset_index(drop=True)
+
+    return gldas_dict_2010_2024
+
+
+gldas_dict_2004_2009 = load_gldas_dict_2004_2009()
+gldas_dict_2010_2024 = load_gldas_dict_2010_2024()
+
+# Checking whether coordinates are same for each month
+coordinates_per_df_gldas = [set(zip(df['lat'], df['lon'])) for df in gldas_dict_2010_2024.values()]
+all_same = all(coords == coordinates_per_df_gldas[0] for coords in coordinates_per_df_gldas)
+if all_same:
+    print("Yes")
+else:
+    print("No")
+
+
+########################################################################################################################
+# Further Feature Engineering
+########################################################################################################################
+# Intersection of latitude and longitude couples that come from Gldas and GRACE datasets.
+a_month_set = set(zip(reference_month_grace['lat'], reference_month_grace['lon']))
+coordinates_set = set(coordinates_per_df_gldas[0])
+intersection_set = a_month_set.intersection(coordinates_set)
+
+# Editing the coordinates in GLDAS according to the intersection set.
+filtered_dfs = {}
+
+for key, dataframe in gldas_dict_2010_2024.items():
+    dataframe['coord_tuple'] = list(zip(dataframe['lat'], dataframe['lon']))
+    filtered_df = dataframe[dataframe['coord_tuple'].apply(lambda x: x in intersection_set)]
+    filtered_dfs[key] = filtered_df.drop(columns=['coord_tuple'])
+
+for key, dataframe in filtered_dfs.items():
+    dataframe.reset_index(drop=True, inplace=True)
+
+# Editing the coordinates in GRACE according to the intersection set
+df = df.groupby('time', group_keys=False).apply(lambda group: group[group[['lat', 'lon']].apply(tuple, axis=1).isin(intersection_set)])
+df.reset_index(drop=True, inplace=True)
+
+# with open("supplemental_material_for_task_2/pkl_files/df.pkl", "wb") as f:
+#     pickle.dump(df, f)
+
+# Filling in the missing months in the dataframe and assigning nan values to the lew_thickness columns.
+df['time'] = pd.to_datetime(df['time'])
+reference_lat_lon = df[df['time'] == '2010-01-01'][['lat', 'lon']].drop_duplicates()
+
+existing_months = df['time'].drop_duplicates()
+all_months = pd.date_range(start='2010-01-01', end='2024-04-01', freq='MS')
+missing_months = all_months.difference(existing_months)
+
+missing_data = pd.concat(
+    [pd.DataFrame({
+        'time': [month] * len(reference_lat_lon),
+        'lat': reference_lat_lon['lat'].values,
+        'lon': reference_lat_lon['lon'].values,
+        'lwe_thickness': np.nan})
+     for month in missing_months]
+)
+
+df_filled_corrected = pd.concat([df, missing_data]).drop_duplicates(subset=['time', 'lat', 'lon']).sort_values(by=['time', 'lat', 'lon']).reset_index(drop=True)
+
+
+
+# GRACE: dataframe to dictionary
+df_filled_corrected['key'] = df_filled_corrected['time'].dt.strftime('%Y%m')
+result_dict = {key: group.drop(columns='key') for key, group in df_filled_corrected.groupby('key')}
+
+for key, value in result_dict.items():
+    value.reset_index(inplace=True, drop=True)
+
+
+# Imputing NaN Values in the dictionary.
+for month_key, month_df in result_dict.items():
+    current_month = month_key[-2:]
+    measurement_index = month_df.index
+
+    for i in measurement_index:
+        if pd.isna(month_df.at[i, 'lwe_thickness']):
+            other_year_values = []
+            for year in range(2010, 2025):
+                year_key = f"{year}{current_month}"
+                if year_key in result_dict:
+                    other_year_df = result_dict[year_key]
+                    if i < len(other_year_df):
+                        value = other_year_df.at[i, 'lwe_thickness']
+                        if pd.notna(value):
+                            other_year_values.append(value)
+
+            if other_year_values:
+                average_value = np.mean(other_year_values)
+                month_df.at[i, 'lwe_thickness'] = average_value
+
+
+# with open('supplemental_material_for_task_2/pkl_files/grace_imputed_in_dict.pkl', 'wb') as f:
+#     pickle.dump(result_dict, f)
+
+# Merging Gldas and GRACE datasets
+
+gldas_dict_2010_2024.pop('202405', None)
+
+########################################################################################################################
+# MERGING GRACE AND GLDAS
+########################################################################################################################
+for key in gldas_dict_2010_2024.keys():
+    gldas_df = gldas_dict_2010_2024[key]
+    grace_df = result_dict[key]
+
+    if grace_df is not None:
+        merged_df = gldas_df.merge(grace_df[['lat', 'lon', 'lwe_thickness']], on=['lat', 'lon'], how='inner')
+        gldas_dict_2010_2024[key] = merged_df
+
+
+with open('supplemental_material_for_task_2/pkl_files/intersection_set.pkl', 'rb') as file:
+    intersection_set = pickle.load(file)
+
+filtered_dict = {}
+for key, df in gldas_dict_2004_2009.items():
+    filtered_df = df[df[['lat', 'lon']].apply(tuple, axis=1).isin(intersection_set)]
+    filtered_dict[key] = filtered_df
+
+gldas_dict_2004_2009 = filtered_dict.copy()
+
+
+# Selecting coordinates in every 209 given longitude
+def reduce_to_first_of_209(df):
+    return df.iloc[::209, :]
+
+
+def convert_cols(df, input_col):
+    col_type = input_col.split("_")[-1]
+
+    if col_type == "tavg":
+        df[f"new_{input_col}"] = df[input_col] * 10800 * 8 * 30
+        df.drop(input_col, axis=1, inplace=True)
+
+    elif col_type == "acc":
+        df[f"new_{input_col}"] = df[input_col] * 8 * 30
+        df.drop(input_col, axis=1, inplace=True)
+
+
+def process_data(dict):
+    results_dict = {}
+
+    for key, df in dict.items():
+        results_dict[key] = reduce_to_first_of_209(df)
+        results_dict[key].reset_index(drop=True, inplace=True)
+
+    for month, df in results_dict.items():
+        for col in df.columns:
+            if "_tavg" in col or "_acc" in col:
+                convert_cols(df, col)
+
         try:
-            if filename.endswith(".csv"):
-                filepath = os.path.join(folder_path, filename)
+            df['MSW'] = (df['new_Rainf_f_tavg'] + df['new_Qsb_acc']) - (
+                        df['new_Evap_tavg'] - df['new_ESoil_tavg'] + df['new_Qs_acc'])
+        except KeyError as e:
+            print(f"KeyError: {e}. Bu sütun eksik olabilir.")
 
-                with open(filepath, 'r', encoding='latin1') as file:
-                    lines = file.readlines()
+        df.rename(columns={'SWE_inst': 'MSN'}, inplace=True)
 
-                    # Find the starting index of the data section
-                    start_idx = next((i for i, line in enumerate(lines) if line.startswith("Werte:")), None)
-                    if start_idx is None:
-                        continue  # Skip files that do not contain 'Werte:'
+        # 'lwe_thickness' sütunu varsa deltaTWS hesaplan?yor
+        if 'lwe_thickness' in df.columns:
+            df['deltaTWS'] = df["lwe_thickness"] * 10
 
-                    start_idx += 1
-                    header_line = lines[start_idx - 1].strip()
+        df['MSM'] = (df["SoilMoi0_10cm_inst"] + df["SoilMoi10_40cm_inst"] + df["SoilMoi40_100cm_inst"] +
+                     df["SoilMoi100_200cm_inst"])
 
-                    # Skip files with 'Invalid' in the header line
-                    if "Invalid" in header_line:
-                        continue
+        df['SoilTMP0_avg'] = (df['SoilTMP0_10cm_inst'] + df['SoilTMP10_40cm_inst'] + df['SoilTMP40_100cm_inst'] +
+                              df['SoilTMP100_200cm_inst'])
 
-                    data_lines = lines[start_idx:]
+        # Silinecek kolonlar listesi
+        cols_to_drop = ['SoilMoi0_10cm_inst', 'SoilMoi10_40cm_inst', 'SoilMoi40_100cm_inst', 'SoilMoi100_200cm_inst',
+                        'SoilTMP0_10cm_inst', 'SoilTMP10_40cm_inst', 'SoilTMP40_100cm_inst', 'SoilTMP100_200cm_inst']
 
-                    data = []
-                    for line in data_lines:
-                        if line.strip():  # Skip empty lines
-                            try:
-                                date_str, value_str = line.split(';')[:2]
+        # 'lwe_thickness' varsa, silinecek kolonlar listesine ekleniyor
+        if 'lwe_thickness' in df.columns:
+            cols_to_drop.append('lwe_thickness')
 
-                                # Try multiple date formats
-                                try:
-                                    date = datetime.strptime(date_str.strip(), "%d.%m.%Y %H:%M:%S").date()
-                                except ValueError:
-                                    try:
-                                        date = datetime.strptime(date_str.strip(), "%d.%m.%Y %H:%M").date()
-                                    except ValueError:
-                                        continue
+        df.drop([col for col in cols_to_drop if col in df.columns], axis=1, inplace=True)
 
-                                # Skip rows with invalid data or specific keywords
-                                if any(keyword in value_str for keyword in ["F", "K", "rekonstruiert aus Version 3->"]):
-                                    continue
+        results_dict[month] = df
 
-                                # Convert value to float
-                                try:
-                                    value = np.float32(value_str.replace(',', '.'))
-                                except ValueError:
-                                    value = np.nan  # Assign NaN if conversion fails
+    return results_dict
 
-                                data.append([date, value])
 
-                            except Exception:
-                                break
+results_dict_2010_2024 = process_data(gldas_dict_2010_2024)
+results_dict_2004_2009 = process_data(gldas_dict_2004_2009)
 
-                    if data:  # Create DataFrame only if data exists
-                        df = pd.DataFrame(data, columns=['Date', 'Values'])
-                        df.drop(df.index[-1], inplace=True)  # Dropping the last row (2022-01-01)
-                        df_name = f"{filename[-10:-4]}"
 
-                        dataframes_dict[df_name] = df
+# Calculating the averages of 'MSW', 'MSM', 'MSN in results_dict_2004_2009.
+first_df = next(iter(results_dict_2004_2009.values()))
 
-                        # Convert keys to integers
-                        int_keys = [int(key) for key in dataframes_dict.keys() if key.isdigit()]
-                        coordinates = tip_coordinates[tip_coordinates['hzbnr01'].isin(int_keys)]
+lat_lon_pairs = first_df[['lat', 'lon']].copy()
 
-        except Exception:
+
+for key, df in results_dict_2004_2009.items():
+    if not df[['lat', 'lon']].equals(lat_lon_pairs):
+        print(f"{key} lat and lon columns are different.")
+        break
+else:
+    print("All DataFrames have the same lat and lon columns.")
+
+
+first_df = next(iter(results_dict_2004_2009.values()))
+mean_df = first_df[['lat', 'lon']].copy()
+
+mean_df[['MSN_mean', 'MSW_mean', 'MSM_mean']] = 0.0
+
+
+for index in range(len(first_df)):
+    mean_df.loc[index, ['MSN_mean', 'MSW_mean', 'MSM_mean']] = [
+        sum(df[col].iloc[index] for df in results_dict_2004_2009.values()) / len(results_dict_2004_2009)
+        for col in ['MSN', 'MSW', 'MSM']]
+
+
+first_rows = []
+
+for key in sorted(results_dict_2004_2009.keys()):
+    df = results_dict_2004_2009[key]
+    first_rows.append(df.iloc[0])
+
+first_rows_df = pd.DataFrame(first_rows)
+
+averages = first_rows_df[['MSN', 'MSW', 'MSM']].mean()
+
+
+for key, df in results_dict_2010_2024.items():
+    df_merged = df.merge(mean_df[['lat', 'lon', 'MSN_mean', 'MSW_mean', 'MSM_mean']], on=['lat', 'lon'])
+
+
+    df['delta_MSN'] = df['MSN'] - df_merged['MSN_mean']
+    df['delta_MSW'] = df['MSW'] - df_merged['MSW_mean']
+    df['delta_MSM'] = df['MSM'] - df_merged['MSM_mean']
+
+    results_dict_2010_2024[key] = df
+
+
+#        deltaMGw = deltaTWS - deltaMSM - deltaMSN - deltaMSw
+for key, df in results_dict_2010_2024.items():
+    df['delta_MGW'] = df['deltaTWS'] - df['delta_MSM'] - df['delta_MSN']  - df['delta_MSW']
+
+
+# with open('supplemental_material_for_task_2/pkl_files/new_12661_results_dict_2004_2009.pkl', 'wb') as file:
+#     pickle.dump(results_dict_2004_2009, file)
+#
+# with open('supplemental_material_for_task_2/pkl_files/new_12661_results_dict_2010_2024.pkl', 'wb') as file:
+#     pickle.dump(results_dict_2010_2024, file)
+
+
+# Train and test split
+train_dict = {}
+test_dict = {}
+
+for key, df in results_dict_2010_2024.items():
+    date_key = pd.to_datetime(str(key), format='%Y%m')
+    year = date_key.year
+
+    if 2010 <= year <= 2018:
+        train_dict[key] = df
+    elif 2019 <= year <= 2024:
+        test_dict[key] = df
+
+
+# with open('supplemental_material_for_task_2/pkl_files/new_1151_train_dict.pkl', 'wb') as file:
+#     pickle.dump(train_dict, file)
+#
+# with open('supplemental_material_for_task_2/pkl_files/new_1151_test_dict.pkl', 'wb') as file:
+#     pickle.dump(test_dict, file)
+#
+# with open('supplemental_material_for_task_2/pkl_files/new_12661_train_dict.pkl', 'rb') as file:
+#     train_dict = pickle.load(file)
+#
+# with open('supplemental_material_for_task_2/pkl_files/new_12661_test_dict.pkl', 'rb') as file:
+#     test_dict = pickle.load(file)
+
+
+# Troubleshooting:
+# Whether the 'lat' and 'lon' columns of DataFrames in the dictionary are different or the same,
+# and prints which DataFrames have different latitude values or the same longitude values.
+lat_values = [df['lat'].values for df in test_dict.values()]
+lon_values = [df['lon'].values for df in test_dict.values()]
+
+for i in range(len(lat_values)):
+    for j in range(i + 1, len(lat_values)):
+        lat_equal = (lat_values[i] == lat_values[j]).all()
+        lon_equal = (lon_values[i] == lon_values[j]).all()
+
+        if not lat_equal:
+            print(f"df{i + 1} ve df{j + 1}: 'lat' columns are different.")
+
+        if not lon_equal:
+            print(f"df{i + 1} ve df{j + 1}: 'lon' columns are the same.")
+
+
+lat_values = [df['lat'].values for df in train_dict.values()]
+lon_values = [df['lon'].values for df in train_dict.values()]
+
+for i in range(len(lat_values)):
+    for j in range(i + 1, len(lat_values)):
+        lat_equal = (lat_values[i] == lat_values[j]).all()
+        lon_equal = (lon_values[i] == lon_values[j]).all()
+
+        if not lat_equal:
+            print(f"df{i + 1} ve df{j + 1}: 'lat' columns are different.")
+
+        if not lon_equal:
+            print(f"df{i + 1} ve df{j + 1}: 'lon' columns are the same.")
+
+
+# Multicollinearity test: Variance inflation factor (VIF)
+with open('supplemental_material_for_task_2/pkl_files/new_1151_results_dict_2010_2024.pkl', 'rb') as file:
+    data_dict = pickle.load(file)
+
+new_dict = {}
+
+for month, df in tqdm(data_dict.items(), desc="Processing months"):
+    for index, row in df.iterrows():
+        lat_lon_key = (row['lat'], row['lon'])
+        if lat_lon_key not in new_dict:
+            new_dict[lat_lon_key] = pd.DataFrame(columns=['date'] + df.columns.tolist()[2:])
+
+        new_row = row.drop(['lat', 'lon']).to_dict()
+        new_row['date'] = month
+
+        new_df = pd.DataFrame([new_row])
+        new_dict[lat_lon_key] = pd.concat([new_dict[lat_lon_key], new_df], ignore_index=True)
+
+
+def calculate_vif(df):
+    X = df.select_dtypes(include='number')
+    vif_data = pd.DataFrame()
+    vif_data["feature"] = X.columns
+    vif_data["VIF"] = [variance_inflation_factor(X.values, i) for i in range(X.shape[1])]
+    return vif_data
+
+vif_results = {}
+for key, df in tqdm(new_dict.items(), desc="Calculating VIF"):
+    vif_results[key] = calculate_vif(df)
+
+for key, result in vif_results.items():
+    print(f"VIF Results for {key}:")
+    print(result)
+
+
+########################################################################################################################
+# MODEL
+########################################################################################################################
+
+train_dfs = [df for key, df in data_dict.items() if 201001 <= int(key) <= 201812]
+train_data = pd.concat(train_dfs)
+
+test_dfs = [df for key, df in data_dict.items() if 201901 <= int(key) <= 202404]
+test_data = pd.concat(test_dfs)
+
+def smape(y_true, y_pred):
+    return 100 * np.mean(2 * np.abs(y_pred - y_true) / (np.abs(y_pred) + np.abs(y_true)))
+
+coordinates = train_data[['lat', 'lon']].drop_duplicates().reset_index(drop=True)
+selected_coordinates = coordinates.iloc[np.linspace(0, len(coordinates) - 1, 50, dtype=int)]
+
+rf_params = {'bootstrap': True, 'max_depth': 20, 'max_features': None,
+             'min_samples_leaf': 2, 'min_samples_split': 2, 'n_estimators': 400}
+model_rf = RandomForestRegressor(**rf_params)
+
+ridge_params = {'alpha': 0.1, 'fit_intercept': False, 'solver': 'svd'}
+model_ridge = Ridge(**ridge_params)
+
+gb_params = {'n_estimators': 400, 'max_depth': 20, 'min_samples_leaf': 2, 'min_samples_split': 2}
+model_gb = GradientBoostingRegressor(**gb_params)
+
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+
+best_models_per_coord = {}
+
+for coord in tqdm(selected_coordinates.itertuples(index=False), desc="50 nokta için ba?ar? ölçülüyor", file=sys.stdout):
+    coord_train_data = train_data[(train_data['lat'] == coord.lat) & (train_data['lon'] == coord.lon)]
+    coord_test_data = test_data[(test_data['lat'] == coord.lat) & (test_data['lon'] == coord.lon)]
+
+    if coord_train_data.empty or coord_test_data.empty:
+        print(f"Warning: {coord} coordinates do not have train or test data. Skipping.")
+        continue
+
+    X_train = coord_train_data.drop(columns=['delta_MGW'])
+    y_train = coord_train_data['delta_MGW'].values.reshape(-1, 1)
+    X_test = coord_test_data.drop(columns=['delta_MGW'])
+    y_test = coord_test_data['delta_MGW'].values.reshape(-1, 1)
+
+    X_train_scaled = scaler_X.fit_transform(X_train)
+    y_train_scaled = scaler_y.fit_transform(y_train)
+    X_test_scaled = scaler_X.transform(X_test)
+
+    models = [model_rf, model_ridge, model_gb]
+    smape_scores = []
+    for model in models:
+        model.fit(X_train_scaled, y_train_scaled.ravel())
+        y_pred_scaled = model.predict(X_test_scaled)
+        y_pred = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1))
+        smape_score = smape(y_test, y_pred)
+        smape_scores.append(smape_score)
+
+    best_two_models_indices = sorted(range(len(models)), key=lambda i: smape_scores[i])[:2]
+    best_models_per_coord[(coord.lat, coord.lon)] = best_two_models_indices
+
+all_predictions = {}
+all_true_values = {}
+all_smape_scores = {}
+
+shap_values_dict = {}
+
+distances = cdist(coordinates[['lat', 'lon']], selected_coordinates[['lat', 'lon']], metric='euclidean')
+nearest_selected_idx = np.argmin(distances, axis=1)
+
+with tqdm(total=len(coordinates), desc="Forecasting", file=sys.stdout) as pbar:
+    for idx, coord in enumerate(coordinates.itertuples(index=False)):
+        coord_train_data = train_data[(train_data['lat'] == coord.lat) & (train_data['lon'] == coord.lon)]
+        coord_test_data = test_data[(test_data['lat'] == coord.lat) & (test_data['lon'] == coord.lon)]
+
+        if coord_train_data.empty or coord_test_data.empty:
+            print(f"Warnning: {coord} coordinates do not have train or test data. Skipping.")
             continue
 
-    return dataframes_dict, coordinates
+        X_train = coord_train_data.drop(columns=['delta_MGW'])
+        y_train = coord_train_data['delta_MGW'].values.reshape(-1, 1)
+        X_test = coord_test_data.drop(columns=['delta_MGW'])
+        y_test = coord_test_data['delta_MGW'].values.reshape(-1, 1)
 
-def to_global(dataframes_dict, prefix=''):
-    """
-    Adds DataFrames from a dictionary to the global namespace with optional prefix.
+        X_train_scaled = scaler_X.fit_transform(X_train)
+        y_train_scaled = scaler_y.fit_transform(y_train)
+        X_test_scaled = scaler_X.transform(X_test)
 
-    Args:
-        dataframes_dict (dict): A dictionary where keys are names (str) and values are DataFrames.
-        prefix (str): An optional string to prefix to each DataFrame name in the global namespace.
-    """
-    for name, dataframe in dataframes_dict.items():
-        globals()[f"{prefix}{name}"] = dataframe
+        nearest_coord = selected_coordinates.iloc[nearest_selected_idx[idx]]
+        best_two_models_indices = best_models_per_coord[(nearest_coord.lat, nearest_coord.lon)]
 
-def process_dataframes(df_dict):
-    """
-    Processes a dictionary of DataFrames by converting date columns, resampling daily data to monthly, and reindexing.
+        best_two_models = [type(models[idx]).__name__ for idx in best_two_models_indices]
 
-    Args:
-        df_dict (dict): A dictionary where keys are DataFrame names and values are DataFrames.
+        meta_model = Ridge()
 
-    Returns:
-        dict: The processed dictionary of DataFrames with date conversion, resampling, and reindexing applied.
-    """
-    for df_name, df_value in df_dict.items():
-        df_value['Date'] = pd.to_datetime(df_value['Date'])
+        y_preds = []
+        for model_idx in best_two_models_indices:
+            model = models[model_idx]
+            model.fit(X_train_scaled, y_train_scaled.ravel())
+            y_pred_scaled = model.predict(X_test_scaled)
+            y_pred = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1))
+            y_preds.append(y_pred)
 
-        if df_value['Date'].dt.to_period('D').nunique() > df_value['Date'].dt.to_period('M').nunique():
-            df_value.set_index('Date', inplace=True)
-            df_dict[df_name] = df_value.resample('MS').mean()
+        y_preds_combined = np.hstack(y_preds)
+        meta_model.fit(y_preds_combined, y_test.ravel())
+        weighted_prediction = meta_model.predict(y_preds_combined)
 
+        smape_score = smape(y_test, weighted_prediction.reshape(-1, 1))
+        all_smape_scores[(coord.lat, coord.lon)] = smape_score
+        all_predictions[(coord.lat, coord.lon)] = weighted_prediction.reshape(-1, 1)
+        all_true_values[(coord.lat, coord.lon)] = y_test
+
+        meta_weights = meta_model.coef_
+
+        if meta_weights[0] > meta_weights[1]:
+            dominant_model = best_two_models[0]
         else:
-            df_value.set_index('Date', inplace=True)
-            df_dict[df_name] = df_value
-
-        all_dates = pd.date_range(start='1960-01-01', end='2021-12-01', freq='MS')
-        new_df = pd.DataFrame(index=all_dates)
-        df_dict[df_name] = new_df.join(df_dict[df_name], how='left').fillna("NaN")
-
-    return df_dict
-
-def process_and_store_data(folder, coordinates, prefix, station_list=None):
-    data_dict, data_coordinates = to_dataframe(folder, coordinates)
-    data_dict = process_dataframes(data_dict)
-
-    for df_name, df in data_dict.items():
-        df.astype('float32')
-
-    to_global(data_dict, prefix=prefix)
-
-    if station_list:
-        data_dict = filter_dataframes_by_stations(data_dict, station_list)
-        data_coordinates = data_coordinates[data_coordinates['hzbnr01'].astype(str).isin(station_list)]
-
-    return data_dict, data_coordinates
-
-def filter_dataframes_by_stations(dataframes_dict, station_list):
-    """
-    Filters a dictionary of DataFrames to include only those whose names are specified in a given CSV file.
-
-    Args:
-        dataframes_dict (dict): A dictionary where keys are names (str) and values are DataFrames.
-        station_list (str): Path to a CSV file that contains the names (str) of the DataFrames to filter.
-
-    Returns:
-        dict: A filtered dictionary containing only the DataFrames whose names are listed in the CSV file.
-    """
-    filtered_dict = {name: df for name, df in dataframes_dict.items() if name in station_list}
-    return filtered_dict
-
-def main():
-    ########################################################################################################################
-    # Creating Dataframes from given CSVs
-    ########################################################################################################################
-    print("\n---------- Data Preprocessing ----------")
-
-    groundwater_all_coordinates = station_coordinates("Groundwater")
-    precipitation_coordinates = station_coordinates("Precipitation")
-    sources_coordinates = station_coordinates("Sources")
-    surface_water_coordinates = station_coordinates("Surface_Water")
-
-    precipitation_folders = [
-        ("N-Tagessummen", "rain_"),
-        ("NS-Tagessummen", "snow_")]
-
-    source_folders = [
-        ("QuellschÃ¼ttung-Tagesmittel", "source_fr_"),
-        ("QuellleitfÃ¤higkeit-Tagesmittel", "conductivity_"),
-        ("Quellwassertemperatur-Tagesmittel", "source_temp_")]
-
-    surface_water_folders = [
-        ("W-Tagesmittel", "surface_water_level_"),
-        ("WT-Monatsmittel", "surface_water_temp_"),
-        ("Schwebstoff-Tagesfracht", "sediment_"),
-        ("Q-Tagesmittel", "surface_water_fr_")]
-
-    # Groundwater Dictionary (Filtered down to the requested 487 stations)
-    stations = pd.read_csv("Ehyd/datasets_ehyd/gw_test_empty.csv")
-    station_list = [col for col in stations.columns[1:]]
-    filtered_groundwater_dict, filtered_gw_coordinates = process_and_store_data(
-        "Ehyd/datasets_ehyd/Groundwater/Grundwasserstand-Monatsmittel",
-        groundwater_all_coordinates, "gw_", station_list)
-
-    print("Processing and storing DataFrames.")
-
-    gw_temp_dict, gw_temp_coordinates = process_and_store_data(os.path.join("Ehyd","datasets_ehyd", "Groundwater", "Grundwassertemperatur-Monatsmittel"), groundwater_all_coordinates, "gwt_")
-    rain_dict, rain_coord = process_and_store_data(os.path.join("Ehyd","datasets_ehyd", "Precipitation", precipitation_folders[0][0]), precipitation_coordinates, "rain_")
-    snow_dict, snow_coord = process_and_store_data(os.path.join("Ehyd","datasets_ehyd", "Precipitation", precipitation_folders[1][0]), precipitation_coordinates, "snow_")
-    source_fr_dict, source_fr_coord = process_and_store_data(os.path.join("Ehyd","datasets_ehyd", "Sources", source_folders[0][0]), sources_coordinates, "source_fr_")
-    conduct_dict, conduct_coord = process_and_store_data(os.path.join("Ehyd","datasets_ehyd", "Sources", source_folders[1][0]), sources_coordinates, "conduct_")
-    source_temp_dict, source_temp_coord = process_and_store_data(os.path.join("Ehyd","datasets_ehyd", "Sources", source_folders[2][0]), sources_coordinates, "source_temp_")
-    surface_water_lvl_dict, surface_water_lvl_coord = process_and_store_data(os.path.join("Ehyd","datasets_ehyd", "Surface_Water", surface_water_folders[0][0]), surface_water_coordinates, "surface_water_lvl_")
-    surface_water_temp_dict, surface_water_temp_coord = process_and_store_data(os.path.join("Ehyd","datasets_ehyd", "Surface_Water", surface_water_folders[1][0]), surface_water_coordinates, "surface_water_temp_")
-    sediment_dict, sediment_coord = process_and_store_data(os.path.join("Ehyd","datasets_ehyd", "Surface_Water", surface_water_folders[2][0]), surface_water_coordinates, "sediment_")
-    surface_water_fr_dict, surface_water_fr_coord = process_and_store_data(os.path.join("Ehyd","datasets_ehyd", "Surface_Water", surface_water_folders[3][0]), surface_water_coordinates, "surface_water_fr_")
-
-    ########################################################################################################################
-    # Gathering associated additional features for required 487 stations
-    ########################################################################################################################
-    print("Finding nearest stations based on coordinates.")
-
-    def calculate_distance(coord1, coord2):
-        """
-        Calculates the Euclidean distance between two points in a Cartesian coordinate system.
-
-        Args:
-            coord1 (tuple): A tuple representing the coordinates (x, y) of the first point.
-            coord2 (tuple): A tuple representing the coordinates (x, y) of the second point.
-
-        Returns:
-            float: The Euclidean distance between the two points.
-        """
-        return distance.euclidean(coord1, coord2)
-
-    def find_nearest_coordinates(gw_row, df, k=20):
-        """
-        Finds the `k` nearest coordinates from a DataFrame to a given point.
-
-        Args:
-            gw_row (pd.Series): A pandas Series representing the coordinates (x, y) of the given point.
-            df (pd.DataFrame): A DataFrame containing the coordinates with columns "x" and "y".
-            k (int, optional): The number of nearest coordinates to return. Defaults to 20.
-
-        Returns:
-            pd.DataFrame: A DataFrame containing the `k` nearest coordinates to the given point.
-        """
-        distances = df.apply(lambda row: calculate_distance(
-            (gw_row['x'], gw_row['y']),
-            (row['x'], row['y'])
-        ), axis=1)
-        nearest_indices = distances.nsmallest(k).index
-        return df.loc[nearest_indices]
-
-    # Creating a dataframe that stores all the associated features' information of the 487 stations.
-    data = pd.DataFrame()
-    def add_nearest_coordinates_column(df_to_add, name, k, df_to_merge=None):
-        if df_to_merge is None:
-            df_to_merge = data  # Use the current value of 'data' as the default
-        results = []
-
-        # Find the nearest stations according to the coordinates
-        for _, gw_row in filtered_gw_coordinates.iterrows():
-            nearest = find_nearest_coordinates(gw_row, df_to_add, k)
-            nearest_list = nearest['hzbnr01'].tolist()
-            results.append({
-                'hzbnr01': gw_row['hzbnr01'],
-                name: nearest_list
-            })
-
-        results_df = pd.DataFrame(results)
-
-        # Ensure that the column exists in both dataframes before merging
-        if 'hzbnr01' in df_to_merge.columns and 'hzbnr01' in results_df.columns:
-            # Merge operation
-            df = df_to_merge.merge(results_df, on='hzbnr01', how='inner')
-
-        else:
-            raise KeyError("Column 'hzbnr01' does not exist in one of the dataframes.")
-
-        return df
-
-    data = add_nearest_coordinates_column(gw_temp_coordinates, 'nearest_gw_temp', 1, df_to_merge=filtered_gw_coordinates)
-    data = add_nearest_coordinates_column(rain_coord, 'nearest_rain', 3)
-    data = add_nearest_coordinates_column(snow_coord, 'nearest_snow', 3)
-    data = add_nearest_coordinates_column(source_fr_coord, 'nearest_source_fr', 1)
-    data = add_nearest_coordinates_column(conduct_coord, 'nearest_conductivity', 1)
-    data = add_nearest_coordinates_column(source_temp_coord, 'nearest_source_temp', 1)
-    data = add_nearest_coordinates_column(surface_water_lvl_coord, 'nearest_owf_level', 3)
-    data = add_nearest_coordinates_column(surface_water_temp_coord, 'nearest_owf_temp', 1)
-    data = add_nearest_coordinates_column(sediment_coord, 'nearest_sediment', 1)
-    data = add_nearest_coordinates_column(surface_water_fr_coord, 'nearest_owf_fr', 3,)
-    data.drop(["x", "y"], axis=1, inplace=True)
-
-    ########################################################################################################################
-    # Imputing NaN Values
-    ########################################################################################################################
-    print("\n---------- Data Imputation ----------")
-
-    def nan_imputer(dataframes):
-        """
-        Imputes missing values in a dictionary of DataFrames by filling NaNs with the corresponding monthly means,
-        and if no means are available, fills them based on the average of the previous and next month's means.
-        Finally, fills any remaining NaN values with 0.
-
-        Args:
-            dataframes (dict): A dictionary where the keys are DataFrame names and the values are DataFrames
-                               containing a 'Values' column with missing values represented as 'NaN'.
-
-        Returns:
-            dict: A dictionary with the same keys as the input, but with NaN values in each DataFrame
-                  replaced by the monthly mean of the 'Values' column, averages of neighboring months, or 0 if no other option is available.
-        """
-        new_dict = {}
-        for df_name, df in dataframes.items():
-            df_copy = df.copy(deep=True)  # Create a deep copy
-            df_copy = df_copy.replace(['NaN', 'nan'], np.nan)  # Replace any 'NaN' or 'nan' strings with np.nan
-            df_copy.index = pd.to_datetime(df_copy.index)  # Ensure index is in datetime format
-
-            # Calculate monthly means
-            monthly_means = df_copy.groupby(df_copy.index.month)['Values'].mean()
-
-            # Fill NaNs with the corresponding monthly means
-            for month in range(1, 13):
-                month_mean = monthly_means.get(month)
-                month_mask = df_copy.index.month == month
-
-                # Fill with the monthly mean if available
-                if pd.notna(month_mean):
-                    df_copy.loc[month_mask, 'Values'] = df_copy.loc[month_mask, 'Values'].fillna(month_mean)
-
-            # Fill remaining NaNs based on neighboring months' averages
-            for month in range(1, 13):
-                month_mask = df_copy.index.month == month
-                remaining_nan_mask = month_mask & df_copy['Values'].isna()
-
-                if remaining_nan_mask.any():  # If there are still NaNs in this month
-                    previous_month_mean = monthly_means.get(month - 1) if month > 1 else None
-                    next_month_mean = monthly_means.get(month + 1) if month < 12 else None
-
-                    # Check if previous and next month means are available
-                    if pd.notna(previous_month_mean) and pd.notna(next_month_mean):
-                        # Fill with the average of the previous and next month means
-                        average = (previous_month_mean + next_month_mean) / 2
-                        df_copy.loc[remaining_nan_mask, 'Values'] = average
-                    elif pd.notna(previous_month_mean):
-                        # Use the previous month mean if available
-                        df_copy.loc[remaining_nan_mask, 'Values'] = previous_month_mean
-                    elif pd.notna(next_month_mean):
-                        # Use the next month mean if available
-                        df_copy.loc[remaining_nan_mask, 'Values'] = next_month_mean
-
-            df_copy['Values'].fillna(0, inplace=True)
-
-            new_dict[df_name] = df_copy
-
-        return new_dict
-
-    filled_filtered_groundwater_dict = nan_imputer(filtered_groundwater_dict)
-    filled_gw_temp_dict = nan_imputer(gw_temp_dict)
-    filled_rain_dict = nan_imputer(rain_dict)
-    filled_snow_dict = nan_imputer(snow_dict)
-    filled_source_fr_dict = nan_imputer(source_fr_dict)
-    filled_source_temp_dict = nan_imputer(source_temp_dict)
-    filled_conduct_dict = nan_imputer(conduct_dict)
-    filled_surface_water_fr_dict = nan_imputer(surface_water_fr_dict)
-    filled_surface_water_lvl_dict = nan_imputer(surface_water_lvl_dict)
-    filled_surface_water_temp_dict = nan_imputer(surface_water_temp_dict)
-    filled_sediment_dict = nan_imputer(sediment_dict)
-
-    print("Complete")
-    ########################################################################################################################
-    # Adding lagged values and rolling means
-    ########################################################################################################################
-    print("\n---------- Feature Engineering ----------")
-
-    filled_dict_list = [filled_gw_temp_dict, filled_filtered_groundwater_dict, filled_snow_dict, filled_rain_dict,
-                        filled_conduct_dict, filled_source_fr_dict, filled_source_temp_dict, filled_surface_water_lvl_dict,
-                        filled_surface_water_fr_dict, filled_surface_water_temp_dict, filled_sediment_dict]
-
-    def add_lag_and_rolling_mean(df, window=6):
-        """
-        Adds lag features and rolling mean to a DataFrame.
-
-        Args:
-            df (pd.DataFrame): A DataFrame with at least one column, which will be used to create lag features
-                               and compute rolling mean. The first column of the DataFrame will be used.
-            window (int, optional): The window size for computing the rolling mean. Defaults to 6.
-
-        Returns:
-            pd.DataFrame: The original DataFrame with additional columns for lag features and rolling mean.
-                          Includes lag features for 1, 2, and 3 periods and rolling mean columns with the specified window size.
-        """
-        column_name = df.columns[0]
-        df['lag_1'] = df[column_name].shift(1)
-        df['lag_2'] = df[column_name].shift(2)
-        df['lag_3'] = df[column_name].shift(3)
-
-        df["rolling_mean_original"] = df[column_name].rolling(window=window).mean()
-
-        for i in range(1, 4):
-            df[f'rolling_mean_{window}_lag_{i}'] = df["rolling_mean_original"].shift(i)
-        return df
-
-    for dictionary in filled_dict_list:
-        for key, df in dictionary.items():
-            dictionary[key] = add_lag_and_rolling_mean(df)
-
-    ########################################################################################################################
-    # Creating two new dictionaries:
-    #   new_dataframes: is a dictionary storing DataFrames specific to each measurement station, containing both the
-    #                   station's data and associated features obtained from the data DataFrame.
-    #   monthly_dataframes: contains monthly versions of the data from new_dataframes, with keys representing months
-    #                   instead of measurement station IDs.
-    ########################################################################################################################
-    data['hzbnr01'] = data['hzbnr01'].apply(lambda x: [x])
-
-    data_sources = {
-        'nearest_gw_temp': ('gw_temp', filled_gw_temp_dict),
-        'nearest_rain': ('rain', filled_rain_dict),
-        'nearest_snow': ('snow', filled_snow_dict),
-        'nearest_conductivity': ('conduct', filled_conduct_dict),
-        'nearest_source_fr': ('source_fr', filled_source_fr_dict),
-        'nearest_source_temp': ('source_temp', filled_source_temp_dict),
-        'nearest_owf_level': ('owf_level', filled_surface_water_lvl_dict),
-        'nearest_owf_temp': ('owf_temp', filled_surface_water_temp_dict),
-        'nearest_owf_fr': ('owf_fr', filled_surface_water_fr_dict),
-        'nearest_sediment': ('sediment', filled_sediment_dict)
-    }
-
-    new_dataframes = {}
-    for idx, row in data.iterrows():
-        code = str(row['hzbnr01'][0])
-
-        if code in filled_filtered_groundwater_dict:
-            df = filled_filtered_groundwater_dict[code].copy()
-
-            for key, (prefix, source_dict) in data_sources.items():
-                for i, code_value in enumerate(row[key]):
-                    code_str = str(code_value)
-                    source_df = source_dict.get(code_str, pd.DataFrame())
-
-                    source_df = source_df.rename(columns=lambda x: f'{prefix}_{i + 1}_{x}')
-                    df = df.join(source_df, how='left')
-
-                    columns = ["Values", "lag_1", "lag_2", "lag_3", "rolling_mean_original", "rolling_mean_6_lag_1", "rolling_mean_6_lag_2", "rolling_mean_6_lag_3"]
-                    for column in columns:
-                        if i == 2:
-                            df[f"{prefix}_{column}_mean"] = (df[f"{prefix}_{i + 1}_{column}"] + df[f"{prefix}_{i}_{column}"] + df[f"{prefix}_{i - 1}_{column}"]) / 3
-
-            new_dataframes[code] = df
-
-
-    print("Created new_dataframes dictionary")
-
-    monthly_dict_85to21 = {}
-    for year in range(1985, 2022):
-        for month in range(1, 13):
-
-            key = f"{year}_{month:02d}"
-            monthly_data = []
-
-            for df_id, df in new_dataframes.items():
-                mask = (df.index.to_period("M").year == year) & (df.index.to_period("M").month == month)
-
-                if mask.any():
-                    filtered_df = df[mask]
-                    new_index = [f"{df_id}" for i in range(len(filtered_df))]
-                    filtered_df.index = new_index
-                    monthly_data.append(filtered_df)
-
-            if monthly_data:
-                combined_df = pd.concat(monthly_data)
-                monthly_dict_85to21[key] = combined_df
-
-    print("Created monthly_dict_85to21 dictionary")
-
-    ########################################################################################################################
-    # SARIMA Model
-    ########################################################################################################################
-    print("\n---------- Model Training ----------")
-
-    def average_correlation_feature_selection(data_dict, threshold=0.1):
-        """
-        Computes average correlation of features with the target variable across multiple dataframes and selects features
-        based on a correlation threshold.
-
-        Args:
-            data_dict (dict): A dictionary where each value is a pandas DataFrame. Each DataFrame should contain a column
-                              named 'Values' representing the target variable.
-            threshold (float, optional): The minimum absolute correlation value required for a feature to be selected.
-                                          Defaults to 0.1.
-
-        Returns:
-            list: A list of feature names that have an average correlation with the target variable above the specified
-                  threshold.
-        """
-        feature_corr_sum = None
-        feature_count = 0
-
-        for df in data_dict.values():
-            corr_matrix = df.corr()
-            target_corr = corr_matrix['Values'].drop('Values')
-
-            if feature_corr_sum is None:
-                feature_corr_sum = target_corr
-            else:
-                feature_corr_sum += target_corr
-
-            feature_count += 1
-
-        avg_corr = feature_corr_sum / feature_count
-
-        selected_features = avg_corr[avg_corr.abs() > threshold].index.tolist()
-
-        return selected_features
-
-    common_features = average_correlation_feature_selection(monthly_dict_85to21, threshold=0.4)
-    """
-    # This commented section includes hyperparameter optimization; therefore, it is not explicitly added to the pipeline.
-    new_start_date = pd.to_datetime('1985-01-01')
-    
-    adjusted_dataframes = {}
-    
-    for key, df in new_dataframes.items():
-        try:
-            df.index = pd.to_datetime(df.index)
-            df_filtered = df[df.index >= new_start_date]
-            adjusted_dataframes[key] = df_filtered
-        except Exception as e:
-            print(f"An error occurred with key {key}: {e}")
-    
-    
-    filtered_dataframes = {}
-    
-    def filter_dataframe_by_features(df, features):
-        target_column = df.columns[0]
-        filtered_features = [target_column] + [col for col in features if col != target_column]
-        df_filtered = df[filtered_features]
-    
-        return df_filtered
-    
-    for key, df in adjusted_dataframes.items():
-        try:
-            filtered_df = filter_dataframe_by_features(df, common_features)
-            filtered_dataframes[key] = filtered_df
-        except KeyError as e:
-            print(f"KeyError: {e} - Some columns in {key} are missing.")
-        except Exception as e:
-            print(f"An error occurred with key {key}: {e}")
-    
-    for key, value in filtered_dataframes.items():
-        print(value.head())
-    
-    # Hyperparameter Optimization
-    p = d = q = range(0, 2)
-    pdq = list(itertools.product(p, d, q))
-    seasonal_pdq = [(x[0], x[1], x[2], 12) for x in list(itertools.product(p, d, q))]
-    
-    def sarima_optimizer_aic(train, exog, pdq, seasonal_pdq):
-        best_aic, best_order, best_seasonal_order = float("inf"), None, None
-        for param in pdq:
-            for param_seasonal in seasonal_pdq:
-                try:
-                    sarimax_model = SARIMAX(train, exog=exog, order=param, seasonal_order=param_seasonal)
-                    results = sarimax_model.fit(disp=0)
-                    aic = results.aic
-                    if aic < best_aic:
-                        best_aic, best_order, best_seasonal_order = aic, param, param_seasonal
-                    print('SARIMA{}x{}12 - AIC:{}'.format(param, param_seasonal, aic))
-                except Exception as e:
-                    print(f"Exception: {e} - SARIMA{param}x{param_seasonal}12")
-                    continue
-        print('SARIMA{}x{}12 - AIC:{}'.format(best_order, best_seasonal_order, best_aic))
-        return best_order, best_seasonal_order
-    
-    results = {}
-    
-    sampled_keys = random.sample(list(filtered_dataframes.keys()), 10)
-    
-    for df_id in sampled_keys:
-        df = filtered_dataframes[df_id]
-        if not df.empty:
-            train = df['Values']
-            exog = df.drop(columns=['Values'])
-            best_order, best_seasonal_order = sarima_optimizer_aic(train, exog, pdq, seasonal_pdq)
-            results[df_id] = {
-                'Best Order': best_order,
-                'Best Seasonal Order': best_seasonal_order
-            }
-        else:
-            results[df_id] = {
-                'Best Order': None,
-                'Best Seasonal Order': None
-            }
-    
-    for df_id, res in results.items():
-        print(f'DataFrame ID: {df_id}')
-        print(f'Best Order: {res["Best Order"]}')
-        print(f'Best Seasonal Order: {res["Best Seasonal Order"]}')
-        print('---')
-    
-    # order=(1, 0, 1) and seasonal_order=(0, 1, 1, 12) are the top picks.
-    
-    
-    for month, df in monthly_dict_with_correlation.items():
-        monthly_dict_with_correlation[month] = df[ ['Values'] + common_features]
-    
-    # Test months to forecast
-    forecast_months = ['2020_01', '2020_02', '2020_03', '2020_04', '2020_05', '2020_06',
-                       '2020_07', '2020_08', '2020_09', '2020_10', '2020_11', '2020_12',
-                       '2021_01', '2021_02', '2021_03', '2021_04', '2021_05', '2021_06',
-                       '2021_07', '2021_08', '2021_09', '2021_10', '2021_11', '2021_12']
-    
-    train_data = {month: df for month, df in monthly_dict_with_correlation.items() if month not in forecast_months}
-    
-    train_data = {k: v for k, v in train_data.items() if k >= "2015_01"}
-    
-    all_data = pd.concat([df for df in train_data.values()])
-    
-    forecasts = {}
-    for station in all_data.index.unique():
-        station_data = all_data.loc[station]
-    
-        model = SARIMAX(
-            station_data['Values'],
-            exog=station_data.drop(columns=['Values']),
-            order=(1, 0, 1),
-            seasonal_order=(0, 1, 1, 12)
-        )
-        model_fit = model.fit(disp=False)
-    
-        forecast = model_fit.get_forecast(steps=24, exog=station_data.drop(columns=['Values']).values[
-                                                         -24:])
-        forecast_values = forecast.predicted_mean
-        forecasts[station] = forecast_values
-    
-    forecast_df = pd.DataFrame(forecasts).T
-    forecast_df.columns = [f'forecast_month_{i + 1}' for i in range(24)]
-    
-    print(forecast_df)
-    
-    test_data = {month: df for month, df in monthly_dict_with_correlation.items() if month in forecast_months}
-    test_data = pd.concat([df for df in test_data.values()])
-    
-    # Calculating SMAPE
-    def smape(y_true, y_pred):
-        return 100 * np.mean(2 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred)))
-    
-    all_actual = []
-    all_predicted = []
-    
-    for station in forecast_df.index:
-        actual_values = test_data.loc[station, 'Values'].values
-        predicted_values = forecast_df.loc[station].values
-    
-        all_actual.extend(actual_values)
-        all_predicted.extend(predicted_values)
-    
-    general_smape = smape(np.array(all_actual), np.array(all_predicted))
-    print(f"Overall SMAPE: {general_smape:.2f}%")
-    # Overall SMAPE: 0.15%
-    """
-
-    ########################################################################################################################
-    # Forecasting
-    ########################################################################################################################
-    for month, df in monthly_dict_85to21.items():
-        monthly_dict_85to21[month] = df[ ['Values'] + common_features]
-
-    monthly_dict_final_train = {k: v for k, v in monthly_dict_85to21.items() if k >= "2015_01"}
-
-    final_data = pd.concat([df for df in monthly_dict_final_train.values()])
-
-    forecasts_final = {}
-    for station in final_data.index.unique():
-        station_data = final_data.loc[station]
-
-        model = SARIMAX(
-            station_data['Values'],
-            exog=station_data.drop(columns=['Values']),
-            order=(1, 0, 1),
-            seasonal_order=(0, 1, 1, 12)
-        )
-        model_fit = model.fit(disp=False)
-
-        forecast = model_fit.get_forecast(steps=30, exog=station_data.drop(columns=['Values']).values[
-                                                         -30:])
-        forecast_values = forecast.predicted_mean
-        forecasts_final[station] = forecast_values
-
-    forecast_final_df = pd.DataFrame(forecasts_final)
-    forecast_final_df.insert(0, 'date', pd.date_range(start='2022-01-01', end='2024-06-01', freq='MS'))
-    csv_columns = pd.read_csv('Ehyd/datasets_ehyd/gw_test_empty.csv', nrows=0).columns.tolist()
-    forecast_final_df = forecast_final_df[csv_columns]
-
-    current_date = datetime.today().strftime('%Y_%m_%d')
-    file_path = f"groundwater_forecasts/forecast_{current_date}.csv"
-
-    forecast_final_df.to_csv(file_path, index=False)
-    print(f"Created 'forecast_{current_date}.csv' under 'groundwater_forecasts' directory.")
-
-if __name__ == "__main__":
-    import sys
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    main()
+            dominant_model = best_two_models[1]
+
+        if dominant_model == 'RandomForestRegressor':
+            explainer_rf = shap.TreeExplainer(models[best_two_models_indices[best_two_models.index('RandomForestRegressor')]])
+            shap_values_rf = explainer_rf.shap_values(scaler_X.transform(coord_test_data.drop(columns=['delta_MGW'])))
+            shap_values = shap_values_rf
+            model_type = 'RandomForest'
+        elif dominant_model == 'Ridge':
+            explainer_ridge = shap.LinearExplainer(models[best_two_models_indices[best_two_models.index('Ridge')]], scaler_X.transform(coord_train_data.drop(columns=['delta_MGW'])))
+            shap_values_ridge = explainer_ridge.shap_values(scaler_X.transform(coord_test_data.drop(columns=['delta_MGW'])))
+            shap_values = shap_values_ridge
+            model_type = 'Ridge'
+        elif dominant_model == 'GradientBoostingRegressor':
+            explainer_gb = shap.TreeExplainer(models[best_two_models_indices[best_two_models.index('GradientBoostingRegressor')]])
+            shap_values_gb = explainer_gb.shap_values(scaler_X.transform(coord_test_data.drop(columns=['delta_MGW'])))
+            shap_values = shap_values_gb
+            model_type = 'GradientBoosting'
+
+        shap_values_dict[(coord.lat, coord.lon)] = {
+            'shap_values': shap_values,
+            'model_type': model_type
+        }
+
+        pbar.update(1)
+
+average_smape = np.mean(list(all_smape_scores.values()))
+print(f'Mean SMAPE: {average_smape:.2f}%')
+
+print(pd.Series(all_smape_scores.values()).describe())
+
+sorted_smape_scores = sorted(all_smape_scores.items(), key=lambda x: x[1], reverse=True)
+highest_smape_key, highest_smape_value = sorted_smape_scores[0]
+print(f"Coordinate with highest SMAPE: {highest_smape_key}, De?er: {highest_smape_value:.2f}%")
+
+
+########################################################################################################################
+# Feature Importance: SHAP
+########################################################################################################################
+color_palette = ['#dc7077', '#eb9874', '#e4d692', '#89c684', '#2ba789']
+
+feature_count = len(X_train.columns) - 2
+cmap = LinearSegmentedColormap.from_list("custom_cmap", color_palette, N=feature_count)
+
+def calculate_mean_shap_values(shap_values_dict, feature_names):
+    total_shap_values = np.zeros(len(feature_names))
+    count = 0
+
+    for coord, shap_info in shap_values_dict.items():
+        shap_values = shap_info['shap_values']
+        shap_values_filtered = shap_values[:, 2:]
+        total_shap_values += np.mean(np.abs(shap_values_filtered), axis=0)
+        count += 1
+
+    mean_shap_values = total_shap_values / count
+    return mean_shap_values
+
+feature_names = X_train.columns.tolist()
+feature_names.remove('lat')
+feature_names.remove('lon')
+
+mean_shap_values = calculate_mean_shap_values(shap_values_dict, feature_names)
+
+sorted_indices = np.argsort(mean_shap_values)[::-1]
+sorted_shap_values = mean_shap_values[sorted_indices]
+sorted_feature_names = np.array(feature_names)[sorted_indices]
+
+bar_colors = [cmap(i / (feature_count - 1)) for i in range(feature_count)]
+
+plt.figure(figsize=(10, 6))
+bars = plt.barh(sorted_feature_names, sorted_shap_values, color=bar_colors[::-1])
+
+plt.xlabel('Average SHAP Value (Feature Importance)')
+plt.ylabel('Features')
+plt.title('Average SHAP Values for All Coordinates')
+plt.gca().invert_yaxis()
+plt.show()
+
+########################################################################################################################
+# Graph of selected coordinates
+########################################################################################################################
+
+# Assign each coordinate to the nearest selected_coordinate
+coordinates = train_data[['lat', 'lon']].drop_duplicates().reset_index(drop=True)
+selected_coordinates = coordinates.iloc[np.linspace(0, len(coordinates) - 1, 50, dtype=int)]
+
+# Find the nearest selected_coordinate based on Euclidean distances
+distances = cdist(coordinates[['lat', 'lon']], selected_coordinates[['lat', 'lon']], metric='euclidean')
+nearest_selected_idx = np.argmin(distances, axis=1)
+
+# Add the nearest selected_coordinate index to each coordinate
+coordinates['nearest_selected'] = nearest_selected_idx
+
+# Color the points based on their nearest selected_coordinate
+fig = px.scatter_geo(
+    coordinates,
+    lat='lat',
+    lon='lon',
+    color='nearest_selected',  # Color based on nearest selected_coordinate
+    title="Grouping of Coordinates by Nearest Selected Coordinate",
+    color_continuous_scale=px.colors.qualitative.Plotly  # Choose color scale
+)
+
+# Add selected_coordinates in a different color
+fig.add_trace(
+    go.Scattergeo(
+        lat=selected_coordinates['lat'],
+        lon=selected_coordinates['lon'],
+        mode='markers',
+        marker=dict(size=10, color='black'),
+        name='Selected Coordinates'
+    )
+)
+
+# Map settings
+fig.update_geos(
+    projection_type="equirectangular",
+    lataxis_range=[-60, 90],
+    showcoastlines=True,
+    coastlinecolor="LightGray"
+)
+
+# Center the title and place it above the map
+fig.update_layout(
+    title={
+        'text': "Grouping of Coordinates by Nearest Selected Coordinate",
+        'y': 0.85,  # Adjusts the height of the title on the Y axis (0 = bottom, 1 = top)
+        'x': 0.5,   # Centers the title on the X axis
+        'xanchor': 'center',
+        'yanchor': 'top'
+    },
+    titlefont=dict(size=24),
+    plot_bgcolor='rgba(0,0,0,0)',
+    paper_bgcolor='rgba(0,0,0,0)'
+)
+
+# Show the map
+fig.show()
+
+
+########################################################################################################################
+# Plot of actual and predicted values of the point with the highest smape value
+########################################################################################################################
+highest_smape_key, highest_smape_value = sorted_smape_scores[0]
+print(f"Coordinate with the highest SMAPE: {highest_smape_key}, De?er: {highest_smape_value:.2f}%")
+
+# Coordinates and values
+coord = highest_smape_key
+y_true = all_true_values[coord].flatten()  # Flattening the array for use
+y_pred = all_predictions[coord].flatten()
+
+dates = pd.date_range(start="2019-01-01", periods=len(y_true), freq='M')
+
+# Create the figure
+fig = go.Figure()
+
+# Add the true values line
+fig.add_trace(go.Scatter(x=dates, y=y_true, mode='lines', name='True Values',
+                         line=dict(color='#e4d692', width=4, dash='solid')))
+
+# Add the predicted values line
+fig.add_trace(go.Scatter(x=dates, y=y_pred, mode='lines', name='Predicted Values',
+                         line=dict(color='#2ba789', width=4, dash='dash')))
+
+# Update layout with English labels and centered title
+fig.update_layout(
+    title={
+        'text': f"True and Predicted Values for Coordinates {coord}",
+        'y': 0.9,  # Adjust the height of the title
+        'x': 0.5,  # Center the title
+        'xanchor': 'center',
+        'yanchor': 'top'
+    },
+    plot_bgcolor='white',
+    paper_bgcolor='white',
+    width=1200,
+    height=500,
+    #xaxis_title="Time",
+    yaxis_title="Values",
+    xaxis=dict(showgrid=True, gridcolor='LightGray', tick0=dates[0], tickformat='%b-%Y', dtick="M12"),  # X axis grid and title
+    yaxis=dict(showgrid=True, gridcolor='LightGray', title_text="Values")   # Y axis grid and title
+)
+
+# Show the figure
+fig.show()
+
+########################################################################################################################
+# Plot of actual and predicted values of the point with the lowest smape value
+########################################################################################################################
+lowest_smape_key, lowest_smape_value = sorted_smape_scores[-1]
+print(f"Coordinate with the lowest SMAPE: {lowest_smape_key}, De?er: {lowest_smape_value:.2f}%")
+
+# Coordinates and values
+coord = lowest_smape_key
+y_true = all_true_values[coord].flatten()  # Flattening the array for use
+y_pred = all_predictions[coord].flatten()
+
+dates = pd.date_range(start="2019-01-01", periods=len(y_true), freq='M')
+
+# Create the figure
+fig = go.Figure()
+
+# Add the true values line
+fig.add_trace(go.Scatter(x=dates, y=y_true, mode='lines', name='True Values',
+                         line=dict(color='#e4d692', width=4, dash='solid')))
+
+# Add the predicted values line
+fig.add_trace(go.Scatter(x=dates, y=y_pred, mode='lines', name='Predicted Values',
+                         line=dict(color='#2ba789', width=4, dash='dash')))
+
+# Update layout with English labels and centered title
+fig.update_layout(
+    title={
+        'text': f"True and Predicted Values for Coordinates {coord}",
+        'y': 0.9,  # Adjust the height of the title
+        'x': 0.5,  # Center the title
+        'xanchor': 'center',
+        'yanchor': 'top'
+    },
+    plot_bgcolor='white',
+    paper_bgcolor='white',
+    width=1200,
+    height=500,
+    #xaxis_title="Time",
+    yaxis_title="Values",
+    xaxis=dict(showgrid=True, gridcolor='LightGray', tick0=dates[0], tickformat='%b-%Y', dtick="M12"),  # X axis grid and title
+    yaxis=dict(showgrid=True, gridcolor='LightGray', title_text="Values")   # Y axis grid and title
+)
+
+# Show the figure
+fig.show()

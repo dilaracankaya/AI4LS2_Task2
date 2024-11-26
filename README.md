@@ -1,4 +1,4 @@
-# AI4LS_Challenge: Task 1
+# AI4LS_Challenge: Task 2
 
 ## Introduction
 This project involves processing multiple CSV files containing time series data from thousands of measurement water stations in Austria ![Austria](https://raw.githubusercontent.com/stevenrskelton/flag-icon/master/png/16/country-4x3/at.png "Austria"). The data is cleaned, filtered, and merged by geographic coordinates to generate forecasts for a specific geographic location using machine learning models.
